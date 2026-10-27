@@ -30,6 +30,30 @@ fsutil.FindInDir("./", func(filePath string, de fs.DirEntry) error {
 }, fsutil.ExcludeDotFile)
 ```
 
+## Batch transactional update
+
+`BatchTxn` applies the same transform to a batch of files with all-or-nothing semantics.
+Files are inspected and staged first, then applied via atomic renames. A journal allows
+crash recovery on the next startup; unchanged files are not rewritten and original file
+permissions are preserved.
+
+```go
+// call it on every process startup, before starting a new batch.
+reports, err := fsutil.RecoverTxns() // resolve interrupted txns to all-old or all-new
+
+tx := fsutil.NewBatchTxn(fsutil.WithTxnStateDir(".fsutil-txn"))
+tx.MustAdd("data/a.json", func(path string, old []byte) (new []byte, note string, err error) {
+    // return the new contents; return old unchanged to skip this file.
+    // note, eg "set keys: a, b", is listed in the plan.
+    return newBytes, "set keys: a, b", nil
+})
+
+plan, err := tx.Plan() // inspect + stage, originals are not touched
+// review plan.ChangedList(), then:
+err = tx.Commit()     // apply all changes at once
+// or: err = tx.Rollback() // keep everything as it was
+```
+
 ## Functions API
 
 > **Note**: doc by run `go doc ./fsutil`
@@ -64,12 +88,14 @@ func MkDirs(perm os.FileMode, dirPaths ...string) error
 func MkParentDir(fpath string) error
 func MkSubDirs(perm os.FileMode, parentDir string, subDirs ...string) error
 func Mkdir(dirPath string, perm os.FileMode) error
+func MustAdd(filePath string, fn TxnTransformFunc)
 func MustCopyFile(srcPath, dstPath string)
 func MustCreateFile(filePath string, filePerm, dirPerm os.FileMode) *os.File
 func MustReadFile(filePath string) []byte
 func MustReadReader(r io.Reader) []byte
 func MustRemove(fPath string)
 func Name(fpath string) string
+func NewBatchTxn(optFns ...BatchTxnOptFunc) *BatchTxn
 func NewIOReader(in any) (r io.Reader, err error)
 func OSTempDir(pattern string) (string, error)
 func OSTempFile(pattern string) (*os.File, error)
@@ -85,6 +111,7 @@ func PathName(fpath string) string
 func PutContents(filePath string, data any, fileFlag ...int) (int, error)
 func QuickOpenFile(filepath string, fileFlag ...int) (*os.File, error)
 func QuietRemove(fPath string)
+func RecoverTxns(stateDir ...string) ([]TxnRecoverReport, error)
 func ReadAll(in any) []byte
 func ReadExistFile(filePath string) []byte
 func ReadFile(filePath string) []byte
@@ -112,10 +139,21 @@ func Unzip(archive, targetDir string) (err error)
 func WalkDir(dir string, fn fs.WalkDirFunc) error
 func WriteFile(filePath string, data any, perm os.FileMode, fileFlag ...int) error
 func WriteOSFile(f *os.File, data any) (n int, err error)
+func WithTxnStateDir(dir string) BatchTxnOptFunc
 type FilterFunc func(fPath string, ent fs.DirEntry) bool
 func ExcludeSuffix(ss ...string) FilterFunc
 func IncludeSuffix(ss ...string) FilterFunc
 type HandleFunc func(fPath string, ent fs.DirEntry) error
+type TxnTransformFunc func(filePath string, oldBytes []byte) (newBytes []byte, note string, err error)
+type BatchTxn struct{ ... }
+func (t *BatchTxn) Add(filePath string, fn TxnTransformFunc) error
+func (t *BatchTxn) Plan() (*TxnPlan, error)
+func (t *BatchTxn) Commit() error
+func (t *BatchTxn) Rollback() error
+type TxnChange struct { Path string; Changed bool; Note string; OldSize, NewSize int64 }
+type TxnPlan struct { ID, StateDir string; Changes []TxnChange }
+func (p *TxnPlan) ChangedList() []TxnChange
+type TxnRecoverReport struct { ID, Outcome string; Resolved, Committed, RolledBack int }
 ```
 
 ## Code Check & Testing
