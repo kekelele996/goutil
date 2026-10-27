@@ -462,6 +462,55 @@ func (c *Cmd) Run() error {
 	return err
 }
 
+// RunCtx runs command with the given context.
+//
+// Like Run(), but when ctx is canceled or its deadline exceeded, the running
+// process is killed and ctx.Err() is returned. The BeforeRun/AfterRun hooks
+// are fired the same as Run().
+func (c *Cmd) RunCtx(ctx context.Context) error {
+	if c.BeforeRun != nil {
+		c.BeforeRun(c)
+	}
+
+	if c.DryRun {
+		if c.AfterRun != nil {
+			c.AfterRun(c, nil)
+		}
+		return nil
+	}
+
+	if err := c.Cmd.Start(); err != nil {
+		if c.AfterRun != nil {
+			c.AfterRun(c, err)
+		}
+		return err
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Cmd.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		if c.AfterRun != nil {
+			c.AfterRun(c, err)
+		}
+		return err
+	case <-ctx.Done():
+		// stop the running process, then wait for it to release resources.
+		if c.Process != nil {
+			_ = c.Process.Kill()
+		}
+		<-done
+
+		if c.AfterRun != nil {
+			c.AfterRun(c, ctx.Err())
+		}
+		return ctx.Err()
+	}
+}
+
 // if IsWindows() {
 // 	return c.Spawn()
 // }

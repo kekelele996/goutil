@@ -1,8 +1,13 @@
 package cmdr
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gookit/goutil/arrutil"
 	"github.com/gookit/goutil/cliutil/cmdline"
@@ -13,6 +18,14 @@ import (
 	"github.com/gookit/goutil/x/ccolor"
 )
 
+// per-task run errors, can check by errors.Is
+var (
+	// ErrTaskTimeout task run exceeded its configured timeout
+	ErrTaskTimeout = errors.New("cmdr: task run timeout")
+	// ErrTaskCanceled task was canceled, before start or while running
+	ErrTaskCanceled = errors.New("cmdr: task run canceled")
+)
+
 // Task struct
 type Task struct {
 	err   error
@@ -21,6 +34,10 @@ type Task struct {
 	// ID for task
 	ID  string
 	Cmd *Cmd
+
+	// Timeout max run duration of the task. zero means no per-task
+	// timeout, fallback to Runner.TaskTimeout on concurrent run.
+	Timeout time.Duration
 
 	// BeforeRun hook
 	BeforeRun func(t *Task)
@@ -76,6 +93,28 @@ func (t *Task) Run() error {
 	return t.err
 }
 
+// RunCtx run command with context. supports render cmd vars like RunWith.
+func (t *Task) RunCtx(ctx context.Context, data maputil.Data) error {
+	if len(data) > 0 {
+		cmdVars := data.StringMap("cmdVars")
+
+		if len(cmdVars) > 0 {
+			for i, val := range t.Cmd.Args {
+				if strings.ContainsRune(val, '$') {
+					t.Cmd.Args[i] = rpl.RenderSimple(val, cmdVars)
+				}
+			}
+		}
+	}
+
+	if t.BeforeRun != nil {
+		t.BeforeRun(t)
+	}
+
+	t.err = t.Cmd.RunCtx(ctx)
+	return t.err
+}
+
 // Err get
 func (t *Task) Err() error {
 	return t.err
@@ -96,6 +135,36 @@ func (t *Task) IsSuccess() bool {
 	return t.err == nil
 }
 
+// TaskResult store the run result of a task on concurrent run
+type TaskResult struct {
+	// ID task name
+	ID string
+	// Index in the runner task list
+	Index int
+	// Cmdline the executed command line
+	Cmdline string
+	// Output combined stdout and stderr of the task, captured separately
+	Output string
+	// Err nil on success. timeout/canceled can check by IsTimeout/IsCanceled
+	Err error
+	// Elapsed task run duration
+	Elapsed time.Duration
+	// Skipped the task was skipped by BeforeRun hook
+	Skipped bool
+}
+
+// IsSuccess of the task result
+func (r *TaskResult) IsSuccess() bool { return r.Err == nil && !r.Skipped }
+
+// IsTimeout of the task result
+func (r *TaskResult) IsTimeout() bool { return errors.Is(r.Err, ErrTaskTimeout) }
+
+// IsCanceled of the task result
+func (r *TaskResult) IsCanceled() bool { return errors.Is(r.Err, ErrTaskCanceled) }
+
+// IsSkipped of the task result
+func (r *TaskResult) IsSkipped() bool { return r.Skipped }
+
 // RunnerHookFn func
 type RunnerHookFn func(r *Runner, t *Task) bool
 
@@ -107,8 +176,14 @@ type Runner struct {
 	tasks []*Task
 	// Errs on run tasks, key is Task.ID
 	Errs errorx.ErrMap
+	// Results of last ConcurrentRun, order is same as added tasks
+	Results []*TaskResult
 
-	// TODO Concurrent run
+	// Workers max concurrent tasks for ConcurrentRun. default 3.
+	Workers int
+	// TaskTimeout default per-task timeout on concurrent run,
+	// for tasks without own Timeout. zero means no timeout.
+	TaskTimeout time.Duration
 
 	// Workdir common workdir
 	Workdir string
@@ -125,8 +200,14 @@ type Runner struct {
 	// IgnoreErr continue on error
 	IgnoreErr bool
 	// BeforeRun hooks on each task. return false to skip current task.
+	//
+	// On ConcurrentRun, hooks are invoked in worker goroutines, so they
+	// must be safe for concurrent use.
 	BeforeRun func(r *Runner, t *Task) bool
 	// AfterRun hook on each task. return false to stop running.
+	//
+	// On ConcurrentRun, return false cancels the batch: no new tasks
+	// start and in-flight tasks are killed.
 	AfterRun func(r *Runner, t *Task) bool
 }
 
@@ -149,6 +230,18 @@ func NewRunner(fns ...func(rr *Runner)) *Runner {
 // WithOutToStd set
 func (r *Runner) WithOutToStd() *Runner {
 	r.OutToStd = true
+	return r
+}
+
+// WithWorkers set max concurrent workers for ConcurrentRun
+func (r *Runner) WithWorkers(n int) *Runner {
+	r.Workers = n
+	return r
+}
+
+// WithTaskTimeout set default per-task timeout for ConcurrentRun
+func (r *Runner) WithTaskTimeout(d time.Duration) *Runner {
+	r.TaskTimeout = d
 	return r
 }
 
@@ -280,6 +373,236 @@ func (r *Runner) RunTask(task *Task) (goon bool) {
 	// store prev
 	r.prev = task
 	return true
+}
+
+// ConcurrentRun run all tasks concurrently, at most r.Workers (default 3)
+// tasks run at the same time.
+//
+// Each task has its own timeout (Task.Timeout, fallback Runner.TaskTimeout);
+// a failed or timeout task does NOT stop other tasks. When ctx is canceled,
+// no more new tasks start, and in-flight tasks are killed (results are
+// marked as ErrTaskCanceled).
+//
+// Each task's stdout+stderr is captured separately into TaskResult.Output,
+// outputs never mix. When r.OutToStd is true, a per-task report with the
+// full output is printed after all tasks finished.
+//
+// Tasks are independent: Task.PrevCond is ignored on concurrent run.
+// The returned results keep the add order; the returned error is the
+// r.Errs map (keyed by task ID) when any task failed.
+func (r *Runner) ConcurrentRun(ctx context.Context) (results []*TaskResult, err error) {
+	results = make([]*TaskResult, len(r.tasks))
+	r.Results = results
+	r.Errs = make(errorx.ErrMap)
+
+	if len(r.tasks) == 0 {
+		return results, nil
+	}
+
+	workers := r.Workers
+	if workers <= 0 {
+		workers = 3
+	}
+	if workers > len(r.tasks) {
+		workers = len(r.tasks)
+	}
+
+	batchCtx, cancelBatch := context.WithCancel(ctx)
+	defer cancelBatch()
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				r.runConcurrentOne(batchCtx, results, idx, &errMu, cancelBatch)
+			}
+		}()
+	}
+
+feed:
+	for i := range r.tasks {
+		select {
+		case <-batchCtx.Done():
+			// caller canceled (or a AfterRun hook stopped the batch):
+			// the not-started tasks will not run.
+			for j := i; j < len(r.tasks); j++ {
+				results[j] = r.markCanceled(r.tasks[j], &errMu)
+			}
+			break feed
+		case jobs <- i:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	if r.OutToStd {
+		printTaskResults(results)
+	}
+
+	return results, r.Errs.ErrorOrNil()
+}
+
+// runConcurrentOne execute a single task in worker, capture output separately.
+func (r *Runner) runConcurrentOne(
+	ctx context.Context,
+	results []*TaskResult,
+	idx int,
+	errMu *sync.Mutex,
+	cancelBatch context.CancelFunc,
+) {
+	task := r.tasks[idx]
+	start := time.Now()
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			resErr := fmt.Errorf("cmdr: task %q panic recover: %v", task.ID, rec)
+			task.err = resErr
+			results[idx] = &TaskResult{
+				ID:      task.ID,
+				Index:   task.index,
+				Cmdline: task.Cmdline(),
+				Err:     resErr,
+				Elapsed: time.Since(start),
+			}
+
+			errMu.Lock()
+			r.Errs[task.ID] = resErr
+			errMu.Unlock()
+		}
+	}()
+
+	if r.BeforeRun != nil && !r.BeforeRun(r, task) {
+		results[idx] = &TaskResult{
+			ID:      task.ID,
+			Index:   task.index,
+			Cmdline: task.Cmdline(),
+			Skipped: true,
+		}
+		return
+	}
+
+	res := &TaskResult{
+		ID:      task.ID,
+		Index:   task.index,
+		Cmdline: task.Cmdline(),
+	}
+
+	// common env and workdir, same as sequential RunTask
+	if len(r.EnvMap) > 0 {
+		task.Cmd.AppendEnv(r.EnvMap)
+	}
+	if r.Workdir != "" && task.Cmd.Dir == "" {
+		task.Cmd.WithWorkDir(r.Workdir)
+	}
+
+	if r.DryRun {
+		res.Elapsed = time.Since(start)
+		res.Output = "DRY-RUN: ok"
+		results[idx] = res
+		return
+	}
+
+	// per-task timeout
+	var taskCtx context.Context
+	var cancel context.CancelFunc
+	if timeout := r.taskTimeout(task); timeout > 0 {
+		taskCtx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		taskCtx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+
+	// capture stdout+stderr into own buffer; restore user writers afterwards
+	var buf bytes.Buffer
+	oldOut, oldErrOut := task.Cmd.Stdout, task.Cmd.Stderr
+	task.Cmd.WithOutput(&buf, &buf)
+	defer func() {
+		task.Cmd.Stdout = oldOut
+		task.Cmd.Stderr = oldErrOut
+	}()
+
+	runErr := task.RunCtx(taskCtx, r.Params)
+	res.Elapsed = time.Since(start)
+	res.Output = buf.String()
+
+	if runErr != nil {
+		res.Err = wrapTaskErr(runErr, task.ID)
+		task.err = res.Err
+
+		errMu.Lock()
+		r.Errs[task.ID] = res.Err
+		errMu.Unlock()
+	}
+	results[idx] = res
+
+	if r.AfterRun != nil && !r.AfterRun(r, task) {
+		cancelBatch()
+	}
+}
+
+// markCanceled build result for a task that never started
+func (r *Runner) markCanceled(task *Task, errMu *sync.Mutex) *TaskResult {
+	resErr := fmt.Errorf("%w: task %q", ErrTaskCanceled, task.ID)
+	task.err = resErr
+
+	errMu.Lock()
+	r.Errs[task.ID] = resErr
+	errMu.Unlock()
+
+	return &TaskResult{
+		ID:      task.ID,
+		Index:   task.index,
+		Cmdline: task.Cmdline(),
+		Err:     resErr,
+	}
+}
+
+// wrapTaskErr map context error to sentinel errors
+func wrapTaskErr(err error, id string) error {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%w: task %q", ErrTaskTimeout, id)
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%w: task %q", ErrTaskCanceled, id)
+	default:
+		return err
+	}
+}
+
+// taskTimeout resolve effective per-task timeout
+func (r *Runner) taskTimeout(task *Task) time.Duration {
+	if task.Timeout > 0 {
+		return task.Timeout
+	}
+	return r.TaskTimeout
+}
+
+// printTaskResults print per-task report with full output, in add order
+func printTaskResults(results []*TaskResult) {
+	for _, res := range results {
+		fmt.Println()
+
+		if res.Skipped {
+			ccolor.Infof("==== Task [%s] #%d SKIPPED\n", res.ID, res.Index+1)
+			continue
+		}
+
+		if res.Err == nil {
+			ccolor.Successf("==== Task [%s] #%d SUCCESS (%s)\n", res.ID, res.Index+1, res.Elapsed)
+		} else {
+			ccolor.Errorf("==== Task [%s] #%d FAILED (%s) %s\n", res.ID, res.Index+1, res.Elapsed, res.Err)
+		}
+
+		ccolor.Infoln("CMD:", res.Cmdline)
+		if output := strings.TrimRight(res.Output, "\n"); output != "" {
+			fmt.Println(output)
+		}
+	}
 }
 
 // Len of tasks
