@@ -1,0 +1,11 @@
+{
+  "app_name": "demo",
+  "port": 8080,
+  "debug": false,
+  "ratio": 1.5,
+  "db": {
+    "host": "127.0.0.1",
+    "port": 5432
+  },
+  "tags": ["base", "common"]
+}
